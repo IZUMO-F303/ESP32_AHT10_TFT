@@ -9,7 +9,30 @@
 
 // WiFi設定
 const char* ssid = "SSID";          // Wi-FiのSSID
-const char* password = "password";  // Wi-Fiのパスワード
+const char* password = "password";  // Wi-Fi of password
+
+// 人感センサー設定
+const int PIR_PIN = 14;
+const unsigned long STARFIELD_TIMEOUT = 1 * 60 * 1000; // 1分でスクリーンセーバー開始 (テスト用)
+const unsigned long DISPLAY_OFF_TIMEOUT = 2 * 60 * 1000; // 2分で消灯 (テスト用)
+unsigned long lastMotionTime = 0;
+
+
+enum DisplayState {
+  STATE_ON,
+  STATE_STARFIELD,
+  STATE_OFF
+};
+DisplayState currentState = STATE_ON;
+const int DEFAULT_BRIGHTNESS = 64;
+
+// スターフィールド設定
+const int MAX_STARS = 100;
+struct Star {
+  float x, y, z;
+  int px, py;
+};
+Star stars[MAX_STARS];
 
 // LovyanGFX configuration for ST7789 (240x240)
 class LGFX : public lgfx::LGFX_Device {
@@ -66,6 +89,53 @@ public:
 LGFX display;
 Adafruit_AHTX0 aht;
 
+void initStarfield() {
+  for (int i = 0; i < MAX_STARS; i++) {
+    stars[i].x = random(-100, 100);
+    stars[i].y = random(-100, 100);
+    stars[i].z = random(1, 240);
+    stars[i].px = -1;
+    stars[i].py = -1;
+  }
+}
+
+void drawStarfield() {
+  display.startWrite();
+  for (int i = 0; i < MAX_STARS; i++) {
+    // 星のサイズを計算 (手前に来るほど大きく: 1〜3ピクセル)
+    int size = (stars[i].z < 80) ? 3 : (stars[i].z < 160) ? 2 : 1;
+
+    // 古い星を消去 (サイズに合わせて消去)
+    if (stars[i].px >= 0) {
+      int prev_size = (stars[i].z + 2 < 80) ? 3 : (stars[i].z + 2 < 160) ? 2 : 1;
+      display.fillRect(stars[i].px, stars[i].py, prev_size, prev_size, TFT_BLACK);
+    }
+
+    // 星の移動
+    stars[i].z -= 2;
+    if (stars[i].z <= 1) {
+      stars[i].x = random(-100, 100);
+      stars[i].y = random(-100, 100);
+      stars[i].z = 240;
+    }
+
+    // 3D投影
+    int sx = (int)(stars[i].x * 120 / stars[i].z) + 120;
+    int sy = (int)(stars[i].y * 120 / stars[i].z) + 120;
+
+    if (sx >= 0 && sx < (240 - size) && sy >= 0 && sy < (240 - size)) {
+      uint16_t brightness = (uint16_t)((240 - stars[i].z) * 255 / 240);
+      uint16_t color = display.color565(brightness, brightness, brightness);
+      display.fillRect(sx, sy, size, size, color);
+      stars[i].px = sx;
+      stars[i].py = sy;
+    } else {
+      stars[i].px = -1;
+    }
+  }
+  display.endWrite();
+}
+
 /**
  * Calculate Absolute Humidity (g/m^3) using Tetens formula
  * @param temp Temperature in Celsius
@@ -93,6 +163,10 @@ void setup() {
     while (1) delay(10);
   }
   Serial.println("AHT10/AHT20 found");
+
+  // PIRセンサーの初期設定
+  pinMode(PIR_PIN, INPUT);
+  lastMotionTime = millis();
 
   display.init();
   display.setRotation(0);
@@ -134,7 +208,48 @@ void setup() {
 
 void loop() {
   static int last_min = -1; // 前回の「分」を保持
+  unsigned long now = millis();
+  unsigned long elapsedSinceMotion = now - lastMotionTime;
 
+  // 人感センサーのチェック
+  if (digitalRead(PIR_PIN) == HIGH) {
+    lastMotionTime = now;
+    if (currentState != STATE_ON) {
+      currentState = STATE_ON;
+      display.setBrightness(DEFAULT_BRIGHTNESS);
+      display.fillScreen(TFT_BLACK);
+      // 区切り線（再描画が必要な場合）
+      display.drawFastHLine(0, 110, 240, TFT_WHITE);
+      last_min = -1; // 表示を即座に更新させる
+      Serial.println("Motion detected! Display ON.");
+    }
+  } else {
+    if (currentState == STATE_ON && elapsedSinceMotion > STARFIELD_TIMEOUT) {
+      currentState = STATE_STARFIELD;
+      display.fillScreen(TFT_BLACK);
+      initStarfield();
+      Serial.println("Starting Starfield screensaver...");
+    } else if (currentState == STATE_STARFIELD && elapsedSinceMotion > DISPLAY_OFF_TIMEOUT) {
+      currentState = STATE_OFF;
+      display.fillScreen(TFT_BLACK);
+      display.setBrightness(0);
+      Serial.println("No motion for 10 minutes. Display OFF.");
+    }
+  }
+
+  // 状態に応じた処理
+  if (currentState == STATE_OFF) {
+    delay(500);
+    return;
+  }
+
+  if (currentState == STATE_STARFIELD) {
+    drawStarfield();
+    delay(20); // アニメーションを滑らかにするため
+    return;
+  }
+
+  // STATE_ON の場合：通常の時計・環境表示
   struct tm timeinfo;
   bool time_valid = getLocalTime(&timeinfo);
 
